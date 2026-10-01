@@ -3259,7 +3259,38 @@ fn show_main_window(window: &tauri::WebviewWindow) {
     let _ = window.set_focus();
 }
 
+/// `GTK_MODULES` without appmenu-gtk-module, or None when it is not loaded.
+/// Ubuntu puts that module in every session to export GTK menu bars to a
+/// global menu; on a native Wayland window it recurses in GTK's `realize`
+/// signal while the menu bar is attached (`app.set_menu` in `setup()`) until
+/// the main thread's stack overflows, so MailVault launched from the desktop
+/// (no `GDK_BACKEND=x11`) died before showing its window.
+#[cfg(target_os = "linux")]
+fn gtk_modules_without_appmenu(modules: &str) -> Option<String> {
+    let all: Vec<&str> = modules.split(':').filter(|m| !m.is_empty()).collect();
+    let kept: Vec<&str> = all.iter().copied().filter(|m| !m.contains("appmenu-gtk-module")).collect();
+    (kept.len() != all.len()).then(|| kept.join(":"))
+}
+
 fn main() {
+    // See `gtk_modules_without_appmenu`. Only on native Wayland, where there
+    // is no global menu to export to; X11 and XWayland keep the module.
+    #[cfg(target_os = "linux")]
+    {
+        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
+            && std::env::var("GDK_BACKEND").map(|b| !b.starts_with("x11")).unwrap_or(true);
+        if wayland {
+            if let Some(kept) = std::env::var("GTK_MODULES").ok().as_deref().and_then(gtk_modules_without_appmenu) {
+                // Single-threaded here: nothing else has started yet.
+                if kept.is_empty() {
+                    std::env::remove_var("GTK_MODULES");
+                } else {
+                    std::env::set_var("GTK_MODULES", kept);
+                }
+            }
+        }
+    }
+
     // WebView2 keeps localStorage/IndexedDB under the host's LOCALAPPDATA; a
     // portable copy keeps them on the drive. Set before any webview exists.
     // UNVERIFIED on a Windows box: that the variable wins over the
@@ -5011,5 +5042,21 @@ mod verify_copies_tests {
         let map = map.unwrap();
         assert_eq!(map.get(&12).map(String::as_str), Some("<a@host.test>"));
         assert_eq!(map.get(&7).map(String::as_str), Some("b@host.test"));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod gtk_modules_tests {
+    use super::gtk_modules_without_appmenu;
+
+    #[test]
+    fn drops_only_appmenu() {
+        assert_eq!(
+            gtk_modules_without_appmenu("gail:atk-bridge:appmenu-gtk-module").as_deref(),
+            Some("gail:atk-bridge")
+        );
+        assert_eq!(gtk_modules_without_appmenu("appmenu-gtk-module").as_deref(), Some(""));
+        assert_eq!(gtk_modules_without_appmenu("gail:atk-bridge"), None);
+        assert_eq!(gtk_modules_without_appmenu(""), None);
     }
 }
